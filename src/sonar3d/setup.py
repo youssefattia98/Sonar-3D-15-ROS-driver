@@ -4,10 +4,27 @@ from glob import glob
 
 package_name = 'sonar3d'
 
+sonar3d_packages = find_packages(exclude=['test'])
+wlsonar_packages = find_packages(where='wlsonar/src')
+
 setup(
     name=package_name,
     version='0.0.0',
-    packages=find_packages(exclude=['test']),
+    packages=sonar3d_packages + wlsonar_packages,
+    package_dir={
+        'wlsonar': 'wlsonar/src/wlsonar',
+    },
+    include_package_data=True,
+    package_data={
+        'wlsonar.range_image_protocol': [
+            '_proto/*.py',
+            '_proto/*.pyi',
+            '_proto/*.proto',
+        ],
+        'wlsonar': [
+            'py.typed',
+        ],
+    },
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
