@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # Publish on any tag starting with a `v`, e.g., v1.2.3
+      - v*
+
+jobs:
+  check:
+    uses: ./.github/workflows/check.yml
+  pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: check
+    environment:
+      name: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with: 
+          python-version: "3.10"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Build
+        run: uv build
+      # Check that basic features work and we didn't miss to include crucial files
+      - name: Smoke test (wheel)
+        run: uv run --isolated --no-project --with dist/*.whl python -c 'import wlsonar; import wlsonar.range_image_protocol; print("ok")' 
+      - name: Smoke test (source distribution)
+        run: uv run --isolated --no-project --with dist/*.tar.gz python -c 'import wlsonar; import wlsonar.range_image_protocol; print("ok")'
+      - name: Publish
+        run: uv publish
