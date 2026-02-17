@@ -7,17 +7,49 @@ from sensor_msgs.msg import Imu
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
 
-from sonar3d.api.interface_sonar_api import set_acoustics, describe_response, enable_multicast
 import socket
 import struct
 import numpy as np
 import sys
+import os
 from pathlib import Path
 import math
 import zlib
 import snappy
 import importlib
+import yaml
 from google.protobuf import descriptor_pool, message_factory
+from ament_index_python.packages import get_package_share_directory
+
+try:
+    _legacy_api = importlib.import_module('sonar3d.api.interface_sonar_api')
+    set_acoustics = _legacy_api.set_acoustics
+    describe_response = _legacy_api.describe_response
+    enable_multicast = _legacy_api.enable_multicast
+except ModuleNotFoundError:
+    from wlsonar import Sonar3D
+
+    def set_acoustics(ip, enabled):
+        try:
+            Sonar3D(ip).set_acoustics_enabled(bool(enabled))
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    def enable_multicast(ip):
+        try:
+            Sonar3D(ip).set_udp_multicast()
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    def describe_response(_ip, response):
+        if isinstance(response, tuple) and len(response) == 2:
+            ok, err = response
+            if ok:
+                return 'success'
+            return f'failed ({err})' if err else 'failed'
+        return 'success' if response else 'failed'
 
 # Ensure local wlsonar package is on the path (vendored under the repo)
 _wlsonar_src = Path(__file__).resolve().parents[1] / 'wlsonar' / 'src'
@@ -46,16 +78,53 @@ class TimerNode(Node):
     # The maximum possible packet size for Sonar 3D-15 data
     BUFFER_SIZE = 65535
 
+    @staticmethod
+    def _load_default_params_from_yaml() -> dict:
+        defaults = {}
+        try:
+            share_dir = Path(get_package_share_directory('sonar3d'))
+            params_file = share_dir / 'config' / 'sonar3d.params.yaml'
+            if not params_file.exists():
+                return defaults
+
+            with params_file.open('r', encoding='utf-8') as f:
+                content = yaml.safe_load(f) or {}
+
+            node_params = {}
+            if isinstance(content, dict):
+                timer_node_cfg = content.get('timer_node', {})
+                if isinstance(timer_node_cfg, dict):
+                    node_params = timer_node_cfg.get('ros__parameters', {})
+
+                if not node_params:
+                    wildcard_cfg = content.get('/**', {})
+                    if isinstance(wildcard_cfg, dict):
+                        node_params = wildcard_cfg.get('ros__parameters', {})
+
+            if isinstance(node_params, dict):
+                defaults = node_params
+        except Exception as e:
+            # Keep node startup robust if config file is missing/malformed
+            print(f"[sonar3d] Failed to load default params YAML: {e}")
+
+        return defaults
+
     def __init__(self):
         super().__init__('timer_node')
+
+        yaml_defaults = self._load_default_params_from_yaml()
+        default_ip = str(yaml_defaults.get('IP', os.getenv('SONAR3D_IP', ''))).strip()
+        default_speed_of_sound = int(yaml_defaults.get('speed_of_sound', 1491))
+        default_local_interface_ip = str(yaml_defaults.get('local_interface_ip', '0.0.0.0')).strip()
+        default_imu_proto_module = str(yaml_defaults.get('imu_proto_module', '')).strip()
         
         # Declare parameters
-        self.declare_parameter('IP', '192.168.194.96')# '192.168.194.96' is the fallback ip, to change this, edit the launchfile.
-        self.declare_parameter('speed_of_sound', 1491)    # setting this takes ~20s
-        self.declare_parameter('local_interface_ip', '0.0.0.0')
-        self.declare_parameter('imu_proto_module', '')
+        self.declare_parameter('IP', default_ip)
+        self.declare_parameter('speed_of_sound', default_speed_of_sound)    # setting this takes ~20s
+        self.declare_parameter('local_interface_ip', default_local_interface_ip)
+        self.declare_parameter('imu_proto_module', default_imu_proto_module)
 
-        self.sonar_ip = self.get_parameter('IP').get_parameter_value().string_value
+        self.sonar_ip = self.get_parameter('IP').get_parameter_value().string_value.strip()
         self.sonar_speed_of_sound = self.get_parameter('speed_of_sound').get_parameter_value().integer_value
         self.local_interface_ip = self.get_parameter('local_interface_ip').get_parameter_value().string_value
         self.imu_proto_module = self.get_parameter('imu_proto_module').get_parameter_value().string_value
@@ -81,12 +150,18 @@ class TimerNode(Node):
         self.image_publisher_ = self.create_publisher(Image, 'sonar_range_image', 10)
         self.imu_publisher_ = self.create_publisher(Imu, 'sonar_imu', 10)
 
-        # Enable the acoustics on the sonar
-        resp = set_acoustics(self.sonar_ip, True)
-        self.get_logger().info(f'Enabling acoustics response: {describe_response(self.sonar_ip, resp)}')
+        if self.sonar_ip:
+            # Enable the acoustics on the sonar
+            resp = set_acoustics(self.sonar_ip, True)
+            self.get_logger().info(f'Enabling acoustics response: {describe_response(self.sonar_ip, resp)}')
 
-        resp = enable_multicast(self.sonar_ip)
-        self.get_logger().info(f'Enabling multicast response: {describe_response(self.sonar_ip, resp)}')
+            resp = enable_multicast(self.sonar_ip)
+            self.get_logger().info(f'Enabling multicast response: {describe_response(self.sonar_ip, resp)}')
+        else:
+            self.get_logger().warning(
+                "Parameter 'IP' is empty. Skipping REST configuration and accepting packets from any source IP. "
+                "Set SONAR3D_IP or pass --ros-args -p IP:=<sonar_ip> to enable filtering/configuration."
+            )
 
         # Set up a UDP socket with multicast membership
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -100,7 +175,7 @@ class TimerNode(Node):
         )
         self.get_logger().info(f"Listening for Sonar 3D-15 RIP packets on {self.MULTICAST_GROUP}:{self.PORT}...")
 
-        if self.sonar_ip != "":
+        if self.sonar_ip:
             self.get_logger().info(f"Filtering packets from IP: {self.sonar_ip}")
 
 
@@ -108,8 +183,8 @@ class TimerNode(Node):
 
         data, addr = self.sock.recvfrom(self.BUFFER_SIZE)
 
-        # If SONAR_IP is configured, and this doesn't match the known Sonar IP, skip it.
-        if not (addr[0] == self.sonar_ip or addr[0] == '192.168.194.96'):
+        # If SONAR_IP is configured and this doesn't match the known Sonar IP, skip it.
+        if self.sonar_ip and addr[0] != self.sonar_ip:
             self.get_logger().info(f"Received packet from {addr[0]}. Data was received from an IP that does not match the declared SONAR_IP ({self.sonar_ip}), so the packet will be skipped.")
             return
 
@@ -193,6 +268,8 @@ class TimerNode(Node):
 
     def _detect_local_ip(self, target_ip: str) -> str | None:
         try:
+            if not target_ip:
+                return None
             tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             tmp.connect((target_ip, 9))
             local_ip = tmp.getsockname()[0]
