@@ -215,6 +215,9 @@ class TimerNode(Node):
         if isinstance(msg_obj, RangeImage):
             # Convert the RangeImage message to voxel data
             pts = range_image_to_xyz(msg_obj)
+            # Publish in ROS FLU by mirroring sensor FRD lateral/vertical axes:
+            # x: forward (unchanged), y: right->left, z: down->up.
+            pts = [(x, -y, -z) for x, y, z in pts]
 
             # Create a PointCloud2 message
             # Create the msg header
