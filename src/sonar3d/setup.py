@@ -4,7 +4,7 @@ from glob import glob
 
 package_name = 'sonar3d'
 
-sonar3d_packages = find_packages(exclude=['test'])
+sonar3d_packages = find_packages()
 wlsonar_packages = find_packages(where='wlsonar/src')
 
 setup(
@@ -37,7 +37,6 @@ setup(
     maintainer_email='support@waterlinked.com',
     description='TODO: Package description',
     license='MIT',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'sonar_publisher = sonar3d.multicast_listener:main'
