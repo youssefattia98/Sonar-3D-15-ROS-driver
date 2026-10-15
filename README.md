@@ -4,8 +4,8 @@
 
 This package provides a ROS 2 driver for the **Water Linked Sonar 3D-15**, a real-time multibeam imaging sonar. The sonar streams 3D range images over UDP multicast, which are decoded and published as standard ROS messages:
 
-- 3D point clouds: `sensor_msgs/PointCloud2` on `/sonar_point_cloud`
-- Raw range images: `sensor_msgs/Image` on `/sonar_range_image`
+- 3D point clouds: `sensor_msgs/PointCloud2` on `/sonar_point_cloud`, stamped with the sonar acquisition time
+- Raw internal IMU samples: `sensor_msgs/Imu` on `/auv/imu/data_raw`, stamped per sample
 
 The driver listens to RIP1 multicast packets, extracts and parses `RangeImage` protobuf messages, and converts the sonar data into formats usable by standard ROS visualization and processing tools.
 
@@ -13,8 +13,11 @@ The driver listens to RIP1 multicast packets, extracts and parses `RangeImage` p
 
 ## Features
 
-- Receives and decodes **RIP1** packets via UDP multicast
-- Publishes point clouds and range images at real-time rates
+- Receives and decodes **RIP1/RIP2** packets via UDP multicast
+- Publishes point clouds at real-time rates using the sensor acquisition timestamp
+- Enables and publishes the sonar's 100 Hz `ImuBatch` output in ROS FLU coordinates
+- Publishes the static `sonar_frame` to `sonar_imu_frame` transform
+- Does not advertise or publish a 2D sonar image topic
 - Automatically enables sonar acoustics and udp multicast on startup
 - Compatible with ROS 2 (tested on **Jazzy**)
 
@@ -24,8 +27,13 @@ The driver listens to RIP1 multicast packets, extracts and parses `RangeImage` p
 
 | Topic               | Message Type              | Description                        |
 |--------------------|---------------------------|------------------------------------|
-| `/sonar_point_cloud` | `sensor_msgs/PointCloud2` | 3D point cloud in ROS frame        |
-| `/sonar_range_image` | `sensor_msgs/Image`       | Raw float32 range image (in meters) |
+| `/sonar_point_cloud` | `sensor_msgs/PointCloud2` | 3D point cloud in ROS frame, stamped at acquisition |
+| `/auv/imu/data_raw` | `sensor_msgs/Imu` | Raw specific force and rate of turn at 100 Hz |
+
+The internal IMU is located at `(-0.022, +0.046, +0.003)` metres from the
+point-cloud origin after converting Water Linked FRD coordinates to ROS FLU.
+The raw packet has no orientation estimate, so the ROS message marks orientation
+as unavailable.
 
 ---
 
@@ -78,4 +86,3 @@ ros2 launch sonar3d sonar3d.launch.py
 ### 6. License
 
 This package is distributed under the MIT License.
-

@@ -1,73 +1,58 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from sensor_msgs.msg import PointCloud2
-from sensor_msgs.msg import Image
 from sensor_msgs.msg import Imu
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
+from geometry_msgs.msg import TransformStamped
+from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 
 import socket
-import struct
-import numpy as np
-import sys
 import os
+import datetime
 from pathlib import Path
 import math
-import zlib
-import snappy
-import importlib
 import yaml
-from google.protobuf import descriptor_pool, message_factory
 from ament_index_python.packages import get_package_share_directory
 
-try:
-    _legacy_api = importlib.import_module('sonar3d.api.interface_sonar_api')
-    set_acoustics = _legacy_api.set_acoustics
-    describe_response = _legacy_api.describe_response
-    enable_multicast = _legacy_api.enable_multicast
-except ModuleNotFoundError:
-    from wlsonar import Sonar3D
-
-    def set_acoustics(ip, enabled):
-        try:
-            Sonar3D(ip).set_acoustics_enabled(bool(enabled))
-            return True, None
-        except Exception as e:
-            return False, str(e)
-
-    def enable_multicast(ip):
-        try:
-            Sonar3D(ip).set_udp_multicast()
-            return True, None
-        except Exception as e:
-            return False, str(e)
-
-    def describe_response(_ip, response):
-        if isinstance(response, tuple) and len(response) == 2:
-            ok, err = response
-            if ok:
-                return 'success'
-            return f'failed ({err})' if err else 'failed'
-        return 'success' if response else 'failed'
-
-# Ensure local wlsonar package is on the path (vendored under the repo)
-_wlsonar_src = Path(__file__).resolve().parents[1] / 'wlsonar' / 'src'
-if _wlsonar_src.exists() and str(_wlsonar_src) not in sys.path:
-    sys.path.insert(0, str(_wlsonar_src))
-
-from wlsonar import range_image_to_xyz
+from wlsonar import Sonar3D, range_image_to_xyz
 from wlsonar.range_image_protocol import (
     unpackb,
     RangeImage,
     BitmapImageGreyscale8,
+    ImuBatch,
     BadIDError,
     CRCMismatchError,
     ExtraDataError,
     UnknownProtobufTypeError,
-    Packet,
-    ProtocolVersion,
 )
+from sonar3d.imu_conversion import imu_batch_to_messages
+
+
+def set_acoustics(ip, enabled):
+    try:
+        Sonar3D(ip).set_acoustics_enabled(bool(enabled))
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def enable_multicast(ip):
+    try:
+        Sonar3D(ip).set_udp_multicast()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def describe_response(_ip, response):
+    ok, err = response
+    if ok:
+        return 'success'
+    return f'failed ({err})' if err else 'failed'
 
 class TimerNode(Node):
 
@@ -116,41 +101,57 @@ class TimerNode(Node):
         default_ip = str(yaml_defaults.get('IP', os.getenv('SONAR3D_IP', ''))).strip()
         default_speed_of_sound = int(yaml_defaults.get('speed_of_sound', 1491))
         default_local_interface_ip = str(yaml_defaults.get('local_interface_ip', '0.0.0.0')).strip()
-        default_imu_proto_module = str(yaml_defaults.get('imu_proto_module', '')).strip()
+        default_sync_time = bool(yaml_defaults.get('sync_time_on_startup', True))
+        default_configure_speed = bool(yaml_defaults.get('configure_speed_of_sound', True))
+        default_enable_imu = bool(yaml_defaults.get('enable_imu', True))
+        default_sonar_frame = str(yaml_defaults.get('sonar_frame', 'sonar_frame')).strip()
+        default_imu_frame = str(yaml_defaults.get('imu_frame', 'sonar_imu_frame')).strip()
         
         # Declare parameters
         self.declare_parameter('IP', default_ip)
         self.declare_parameter('speed_of_sound', default_speed_of_sound)    # setting this takes ~20s
         self.declare_parameter('local_interface_ip', default_local_interface_ip)
-        self.declare_parameter('imu_proto_module', default_imu_proto_module)
+        self.declare_parameter('sync_time_on_startup', default_sync_time)
+        self.declare_parameter('configure_speed_of_sound', default_configure_speed)
+        self.declare_parameter('enable_imu', default_enable_imu)
+        self.declare_parameter('sonar_frame', default_sonar_frame)
+        self.declare_parameter('imu_frame', default_imu_frame)
 
         self.sonar_ip = self.get_parameter('IP').get_parameter_value().string_value.strip()
         self.sonar_speed_of_sound = self.get_parameter('speed_of_sound').get_parameter_value().integer_value
         self.local_interface_ip = self.get_parameter('local_interface_ip').get_parameter_value().string_value
-        self.imu_proto_module = self.get_parameter('imu_proto_module').get_parameter_value().string_value
+        self.sync_time_on_startup = self.get_parameter('sync_time_on_startup').value
+        self.configure_speed_of_sound = self.get_parameter('configure_speed_of_sound').value
+        self.enable_imu = self.get_parameter('enable_imu').value
+        self.sonar_frame = self.get_parameter('sonar_frame').value
+        self.imu_frame = self.get_parameter('imu_frame').value
 
         # Create a timer that calls the timer_callback every sample_time seconds 
         sample_time = 0.01          # sample time in seconds
         self.create_timer(sample_time, self.timer_callback)
         self.get_logger().info(f'Timer Node initialized with {1/sample_time} Hz')
 
-        if self.imu_proto_module:
-            try:
-                importlib.import_module(self.imu_proto_module)
-                self.get_logger().info(
-                    f"Loaded IMU proto module: {self.imu_proto_module}"
-                )
-            except Exception as e:
-                self.get_logger().warning(
-                    f"Failed to load IMU proto module '{self.imu_proto_module}': {e}"
-                )
-
         # Create a publisher that publishes the point cloud data
-        self.pointcloud_publisher_ = self.create_publisher(PointCloud2, 'sonar_point_cloud', 10)
-        self.image_publisher_ = self.create_publisher(Image, 'sonar_range_image', 10)
-        self.imu_publisher_ = self.create_publisher(Imu, 'sonar_imu', 10)
+        # Retain only the newest cloud. TRANSIENT_LOCAL offered by the publisher
+        # is compatible with both VOLATILE and TRANSIENT_LOCAL subscribers.
+        pointcloud_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.pointcloud_publisher_ = self.create_publisher(
+            PointCloud2, 'sonar_point_cloud', pointcloud_qos
+        )
+        self.imu_publisher_ = self.create_publisher(
+            Imu, '/auv/imu/data_raw', 100
+        )
+        self.static_tf_broadcaster = StaticTransformBroadcaster(self)
+        self._publish_imu_transform()
 
         if self.sonar_ip:
+            self._configure_sonar()
+
             # Enable the acoustics on the sonar
             resp = set_acoustics(self.sonar_ip, True)
             self.get_logger().info(f'Enabling acoustics response: {describe_response(self.sonar_ip, resp)}')
@@ -178,6 +179,72 @@ class TimerNode(Node):
         if self.sonar_ip:
             self.get_logger().info(f"Filtering packets from IP: {self.sonar_ip}")
 
+    def _configure_sonar(self):
+        """Apply settings which must be correct before timestamped data arrives."""
+        try:
+            sonar = Sonar3D(self.sonar_ip)
+        except Exception as e:
+            self.get_logger().warning(
+                f"Could not connect to sonar configuration API: {e}"
+            )
+            return
+
+        if self.sync_time_on_startup:
+            try:
+                time_status = sonar.get_time_status()
+                if time_status.ntp_synced:
+                    self.get_logger().info(
+                        f"Sonar clock is synchronized to {time_status.ntp_synced_to}"
+                    )
+                else:
+                    sonar.set_time_manual(datetime.datetime.now(datetime.timezone.utc))
+                    self.get_logger().info("Synchronized sonar clock to this computer (UTC)")
+            except Exception as e:
+                self.get_logger().warning(f"Could not synchronize sonar clock: {e}")
+
+        if self.configure_speed_of_sound and self.sonar_speed_of_sound > 0:
+            try:
+                configured_speed = float(sonar.get_speed_of_sound())
+                target_speed = float(self.sonar_speed_of_sound)
+                if abs(configured_speed - target_speed) > 0.5:
+                    sonar.set_speed_of_sound(target_speed)
+                    self.get_logger().info(
+                        f"Set sonar speed of sound to {target_speed:.1f} m/s "
+                        f"(was {configured_speed:.1f} m/s)"
+                    )
+                else:
+                    self.get_logger().info(
+                        f"Sonar speed of sound is {configured_speed:.1f} m/s"
+                    )
+            except Exception as e:
+                self.get_logger().warning(
+                    f"Could not configure sonar speed of sound: {e}"
+                )
+
+        if self.enable_imu:
+            try:
+                sonar.set_output_imu_batch_enabled(True)
+                self.get_logger().info('Enabled sonar ImuBatch output')
+            except Exception as e:
+                self.get_logger().warning(
+                    f"Could not enable sonar ImuBatch output: {e}"
+                )
+
+    def _publish_imu_transform(self):
+        """Publish the internal IMU position relative to the point-cloud origin."""
+        transform = TransformStamped()
+        transform.header.stamp = self.get_clock().now().to_msg()
+        transform.header.frame_id = self.sonar_frame
+        transform.child_frame_id = self.imu_frame
+
+        # Water Linked specifies (-22, -46, -3) mm in sonar FRD. In ROS FLU
+        # this is (-22, +46, +3) mm. Both FLU frames have aligned axes.
+        transform.transform.translation.x = -0.022
+        transform.transform.translation.y = 0.046
+        transform.transform.translation.z = 0.003
+        transform.transform.rotation.w = 1.0
+        self.static_tf_broadcaster.sendTransform(transform)
+
 
     def timer_callback(self):
 
@@ -191,59 +258,62 @@ class TimerNode(Node):
         try:
             msg_obj = unpackb(
                 data,
-                known_message_types=(RangeImage, BitmapImageGreyscale8),
+                known_message_types=(RangeImage, BitmapImageGreyscale8, ImuBatch),
                 max_packet_size=self.BUFFER_SIZE,
             )
-        except UnknownProtobufTypeError as e:
-            # Attempt to decode unknown Any messages (e.g., IMU orientation)
-            any_msg = self._extract_any_from_rip_packet(data)
-            if any_msg is None:
-                return
-            self._handle_any_message(any_msg)
+        except UnknownProtobufTypeError:
+            # Future protocol messages can be safely ignored by this driver.
             return
         except (BadIDError, CRCMismatchError, ExtraDataError, ValueError) as e:
-            # Unknown message types may surface as ValueError via different module copies
-            if "Unknown message type in Range Image Protocol Packet" in str(e):
-                any_msg = self._extract_any_from_rip_packet(data)
-                if any_msg is None:
-                    return
-                self._handle_any_message(any_msg)
-                return
             self.get_logger().warning(f"Failed to decode RIP packet: {e}")
             return
 
         if isinstance(msg_obj, RangeImage):
             # Convert the RangeImage message to voxel data
-            pts = range_image_to_xyz(msg_obj)
+            raw_pts = range_image_to_xyz(msg_obj)
             # Publish in ROS FLU by mirroring sensor FRD lateral/vertical axes:
             # x: forward (unchanged), y: right->left, z: down->up.
-            pts = [(x, -y, -z) for x, y, z in pts]
+            # The Water Linked converter returns None for pixels without a
+            # valid range.  Those pixels are expected and must not terminate
+            # the entire ROS node.
+            pts = []
+            for point in raw_pts:
+                if point is None:
+                    continue
+                try:
+                    x, y, z = point
+                    x, y, z = float(x), float(y), float(z)
+                except (TypeError, ValueError):
+                    continue
+                if not all(math.isfinite(value) for value in (x, y, z)):
+                    continue
+                pts.append((x, -y, -z))
 
             # Create a PointCloud2 message
             # Create the msg header
             header = Header()
-            header.stamp = self.get_clock().now().to_msg()  # Use ROS2 time
-            header.frame_id = 'sonar_frame'
+            # Preserve the acquisition time supplied by the sonar. Stamping here
+            # with the callback time would include network and processing latency.
+            header.stamp.sec = msg_obj.header.timestamp.seconds
+            header.stamp.nanosec = msg_obj.header.timestamp.nanos
+            header.frame_id = self.sonar_frame
 
             cloud_msg = point_cloud2.create_cloud_xyz32(header, pts)
 
             # Publish the PointCloud2 message
             self.pointcloud_publisher_.publish(cloud_msg)
 
-            # Publish the raw range image
-            img_msg = Image()
-            img_msg.header = header
-            img_msg.height = msg_obj.height
-            img_msg.width = msg_obj.width
-            img_msg.encoding = '32FC1'
-            img_msg.is_bigendian = False
-            img_msg.step = msg_obj.width * 4
-            range_image = (np.array(msg_obj.image_pixel_data, dtype=np.uint32) * msg_obj.image_pixel_scale).astype(np.float32)
-            img_msg.data = range_image.tobytes()
-            self.image_publisher_.publish(img_msg)
         elif isinstance(msg_obj, BitmapImageGreyscale8):
-            # Currently not published as a separate topic
+            # The driver intentionally does not publish 2D sonar images.
             return
+        elif isinstance(msg_obj, ImuBatch):
+            try:
+                messages = imu_batch_to_messages(msg_obj, self.imu_frame)
+            except ValueError as e:
+                self.get_logger().warning(str(e))
+                return
+            for imu_msg in messages:
+                self.imu_publisher_.publish(imu_msg)
 
     def _join_multicast_group(self):
         group = socket.inet_aton(self.MULTICAST_GROUP)
@@ -281,185 +351,21 @@ class TimerNode(Node):
         except Exception:
             return None
 
-    def _extract_any_from_rip_packet(self, data: bytes):
-        if len(data) < 12:
-            return None
-
-        magic = data[:4]
-        if magic not in (ProtocolVersion.RIP1.bytes(), ProtocolVersion.RIP2.bytes()):
-            return None
-
-        total_length = struct.unpack('<I', data[4:8])[0]
-        if total_length < 12 or total_length > len(data):
-            return None
-
-        payload = data[8: total_length - 4]
-        crc_received = struct.unpack('<I', data[total_length - 4: total_length])[0]
-        crc_calculated = zlib.crc32(data[: total_length - 4]) & 0xffffffff
-        if crc_calculated != crc_received:
-            return None
-
-        if magic == ProtocolVersion.RIP2.bytes():
-            try:
-                payload = snappy.uncompress(payload)
-            except Exception:
-                return None
-
-        packet = Packet()
-        try:
-            packet.ParseFromString(payload)
-        except Exception:
-            return None
-
-        if not packet.msg.IsInitialized():
-            return None
-
-        return packet.msg
-
-    def _handle_any_message(self, any_msg):
-        type_name = any_msg.TypeName()
-        msg = self._decode_any_message(any_msg)
-        if msg is None:
-            self.get_logger().warning(
-                f"RIP packet contains unknown message type '{type_name}', no decoder available."
-            )
-            return
-
-        if type_name.endswith('ImuOrientation'):
-            self._publish_imu(msg)
-            return
-
-        self.get_logger().debug(f"Unhandled RIP Any message type: {type_name}")
-
-    def _decode_any_message(self, any_msg):
-        type_name = any_msg.TypeName()
-        try:
-            desc = descriptor_pool.Default().FindMessageTypeByName(type_name)
-        except KeyError:
-            return None
-
-        msg_cls = message_factory.MessageFactory().GetPrototype(desc)
-        msg = msg_cls()
-        try:
-            msg.ParseFromString(any_msg.value)
-        except Exception:
-            return None
-        return msg
-
-    def _publish_imu(self, imu_msg):
-        # Attempt to map fields from internal IMU message to sensor_msgs/Imu
-        orientation = self._extract_quaternion(imu_msg)
-        angular_velocity = self._extract_vector3(imu_msg, ['angular_velocity', 'gyro'])
-        linear_acceleration = self._extract_vector3(imu_msg, ['linear_acceleration', 'acceleration'])
-
-        if orientation is None:
-            self.get_logger().warning('IMU message missing orientation, skipping publish.')
-            return
-
-        imu_out = Imu()
-        imu_out.header.stamp = self.get_clock().now().to_msg()
-        imu_out.header.frame_id = 'sonar_frame'
-
-        imu_out.orientation.x = orientation[0]
-        imu_out.orientation.y = orientation[1]
-        imu_out.orientation.z = orientation[2]
-        imu_out.orientation.w = orientation[3]
-
-        if angular_velocity is not None:
-            imu_out.angular_velocity.x = angular_velocity[0]
-            imu_out.angular_velocity.y = angular_velocity[1]
-            imu_out.angular_velocity.z = angular_velocity[2]
-
-        if linear_acceleration is not None:
-            imu_out.linear_acceleration.x = linear_acceleration[0]
-            imu_out.linear_acceleration.y = linear_acceleration[1]
-            imu_out.linear_acceleration.z = linear_acceleration[2]
-
-        self.imu_publisher_.publish(imu_out)
-
-    def _extract_quaternion(self, msg):
-        # Direct quaternion fields
-        quat = self._extract_vector4(msg, ['orientation', 'quaternion'])
-        if quat is not None:
-            return quat
-
-        # Individual fields
-        for prefix in ['orientation', 'quat', 'q']:
-            values = self._extract_components(msg, prefix, ['x', 'y', 'z', 'w'])
-            if values is not None:
-                return values
-
-        # Roll/pitch/yaw
-        rpy = self._extract_components(msg, '', ['roll', 'pitch', 'yaw'])
-        if rpy is not None:
-            roll, pitch, yaw = rpy
-            return self._rpy_to_quaternion(roll, pitch, yaw)
-
-        return None
-
-    def _extract_vector3(self, msg, names):
-        for name in names:
-            if hasattr(msg, name):
-                sub = getattr(msg, name)
-                values = self._extract_components(sub, '', ['x', 'y', 'z'])
-                if values is not None:
-                    return values
-            values = self._extract_components(msg, name, ['x', 'y', 'z'])
-            if values is not None:
-                return values
-        return None
-
-    def _extract_vector4(self, msg, names):
-        for name in names:
-            if hasattr(msg, name):
-                sub = getattr(msg, name)
-                values = self._extract_components(sub, '', ['x', 'y', 'z', 'w'])
-                if values is not None:
-                    return values
-            values = self._extract_components(msg, name, ['x', 'y', 'z', 'w'])
-            if values is not None:
-                return values
-        return None
-
-    def _extract_components(self, msg, prefix, components):
-        values = []
-        for comp in components:
-            name = f"{prefix}_{comp}" if prefix else comp
-            if hasattr(msg, name):
-                values.append(getattr(msg, name))
-            else:
-                return None
-        return tuple(values)
-
-    def _rpy_to_quaternion(self, roll, pitch, yaw):
-        cy = math.cos(yaw * 0.5)
-        sy = math.sin(yaw * 0.5)
-        cp = math.cos(pitch * 0.5)
-        sp = math.sin(pitch * 0.5)
-        cr = math.cos(roll * 0.5)
-        sr = math.sin(roll * 0.5)
-
-        w = cr * cp * cy + sr * sp * sy
-        x = sr * cp * cy - cr * sp * sy
-        y = cr * sp * cy + sr * cp * sy
-        z = cr * cp * sy - sr * sp * cy
-        return (x, y, z, w)
-
-        
-        
-    
-
 def main(args=None):
-    rclpy.init(args=args)
-    node = TimerNode()
-
-    rclpy.spin(node)
-
-    # Destroy the node explicitly
-    # (optional - otherwise it will be done automatically
-    # when the garbage collector destroys the node object)
-    node.destroy_node()
-    rclpy.shutdown()
+    node = None
+    try:
+        rclpy.init(args=args)
+        node = TimerNode()
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # Ctrl-C is a normal shutdown, including while the offline sonar's
+        # REST endpoint is still being contacted during node construction.
+        pass
+    finally:
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

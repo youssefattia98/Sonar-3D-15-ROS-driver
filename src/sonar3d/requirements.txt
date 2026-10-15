@@ -1,7 +1,4 @@
--r sonar3d/api/requirements.txt
-
 setuptools
 numpy
 python-snappy>=0.7.3
 wlsonar>=0.2.0
-
