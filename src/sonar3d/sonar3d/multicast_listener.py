@@ -104,6 +104,7 @@ class TimerNode(Node):
         default_sync_time = bool(yaml_defaults.get('sync_time_on_startup', True))
         default_configure_speed = bool(yaml_defaults.get('configure_speed_of_sound', True))
         default_enable_imu = bool(yaml_defaults.get('enable_imu', True))
+        default_correct_clock = bool(yaml_defaults.get('correct_sonar_clock_offset', True))
         default_sonar_frame = str(yaml_defaults.get('sonar_frame', 'sonar_frame')).strip()
         default_imu_frame = str(yaml_defaults.get('imu_frame', 'sonar_imu_frame')).strip()
         
@@ -114,6 +115,7 @@ class TimerNode(Node):
         self.declare_parameter('sync_time_on_startup', default_sync_time)
         self.declare_parameter('configure_speed_of_sound', default_configure_speed)
         self.declare_parameter('enable_imu', default_enable_imu)
+        self.declare_parameter('correct_sonar_clock_offset', default_correct_clock)
         self.declare_parameter('sonar_frame', default_sonar_frame)
         self.declare_parameter('imu_frame', default_imu_frame)
 
@@ -123,8 +125,13 @@ class TimerNode(Node):
         self.sync_time_on_startup = self.get_parameter('sync_time_on_startup').value
         self.configure_speed_of_sound = self.get_parameter('configure_speed_of_sound').value
         self.enable_imu = self.get_parameter('enable_imu').value
+        self.correct_sonar_clock_offset = self.get_parameter(
+            'correct_sonar_clock_offset'
+        ).value
         self.sonar_frame = self.get_parameter('sonar_frame').value
         self.imu_frame = self.get_parameter('imu_frame').value
+        self.sonar_clock_offset_ns = None
+        self.last_sonar_timestamp_ns = None
 
         # Create a timer that calls the timer_callback every sample_time seconds 
         sample_time = 0.01          # sample time in seconds
@@ -144,7 +151,7 @@ class TimerNode(Node):
             PointCloud2, 'sonar_point_cloud', pointcloud_qos
         )
         self.imu_publisher_ = self.create_publisher(
-            Imu, '/auv/imu/data_raw', 100
+            Imu, '/sonr/imu/data_raw', 100
         )
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
         self._publish_imu_transform()
@@ -249,6 +256,7 @@ class TimerNode(Node):
     def timer_callback(self):
 
         data, addr = self.sock.recvfrom(self.BUFFER_SIZE)
+        received_at = self.get_clock().now()
 
         # If SONAR_IP is configured and this doesn't match the known Sonar IP, skip it.
         if self.sonar_ip and addr[0] != self.sonar_ip:
@@ -294,8 +302,11 @@ class TimerNode(Node):
             header = Header()
             # Preserve the acquisition time supplied by the sonar. Stamping here
             # with the callback time would include network and processing latency.
-            header.stamp.sec = msg_obj.header.timestamp.seconds
-            header.stamp.nanosec = msg_obj.header.timestamp.nanos
+            timestamp_ns = self._sonar_timestamp_ns(msg_obj.header.timestamp)
+            corrected_timestamp_ns = timestamp_ns + (self.sonar_clock_offset_ns or 0)
+            header.stamp.sec, header.stamp.nanosec = divmod(
+                corrected_timestamp_ns, 1_000_000_000
+            )
             header.frame_id = self.sonar_frame
 
             cloud_msg = point_cloud2.create_cloud_xyz32(header, pts)
@@ -308,12 +319,59 @@ class TimerNode(Node):
             return
         elif isinstance(msg_obj, ImuBatch):
             try:
-                messages = imu_batch_to_messages(msg_obj, self.imu_frame)
+                if msg_obj.timestamp:
+                    self._update_sonar_clock_offset(
+                        msg_obj.timestamp[-1], received_at.nanoseconds
+                    )
+                messages = imu_batch_to_messages(
+                    msg_obj,
+                    self.imu_frame,
+                    self.sonar_clock_offset_ns or 0,
+                )
             except ValueError as e:
                 self.get_logger().warning(str(e))
                 return
             for imu_msg in messages:
                 self.imu_publisher_.publish(imu_msg)
+
+    @staticmethod
+    def _sonar_timestamp_ns(timestamp):
+        return timestamp.seconds * 1_000_000_000 + timestamp.nanos
+
+    def _update_sonar_clock_offset(self, timestamp, received_at_ns):
+        """Map the sonar UTC clock onto ROS time using minimum observed delay.
+
+        The newest sample in each IMU batch has the smallest and most stable
+        acquisition-to-reception delay. Taking the minimum observed offset
+        removes the sonar clock error without adding callback or point-cloud
+        processing latency to the acquisition timestamps.
+        """
+        if not self.correct_sonar_clock_offset:
+            return
+
+        timestamp_ns = self._sonar_timestamp_ns(timestamp)
+        rebooted = (
+            self.last_sonar_timestamp_ns is not None
+            and timestamp_ns + 5_000_000_000 < self.last_sonar_timestamp_ns
+        )
+        observed_offset_ns = received_at_ns - timestamp_ns
+
+        if rebooted:
+            self.sonar_clock_offset_ns = None
+            self.get_logger().warning(
+                'Sonar timestamp jumped backwards; resetting clock synchronization'
+            )
+
+        previous_offset_ns = self.sonar_clock_offset_ns
+        if previous_offset_ns is None or observed_offset_ns < previous_offset_ns:
+            self.sonar_clock_offset_ns = observed_offset_ns
+            if previous_offset_ns is None:
+                self.get_logger().info(
+                    'Sonar-to-ROS clock offset initialized to '
+                    f'{observed_offset_ns / 1e9:+.6f} s'
+                )
+
+        self.last_sonar_timestamp_ns = timestamp_ns
 
     def _join_multicast_group(self):
         group = socket.inet_aton(self.MULTICAST_GROUP)

@@ -3,7 +3,7 @@
 from sensor_msgs.msg import Imu
 
 
-def imu_batch_to_messages(batch, frame_id):
+def imu_batch_to_messages(batch, frame_id, timestamp_offset_ns=0):
     """Convert one sonar FRD ImuBatch to timestamped ROS FLU Imu messages."""
     samples = int(batch.samples)
     if (
@@ -23,9 +23,16 @@ def imu_batch_to_messages(batch, frame_id):
         vector_index = sample_index * 3
         timestamp = batch.timestamp[sample_index]
 
+        corrected_timestamp_ns = (
+            timestamp.seconds * 1_000_000_000
+            + timestamp.nanos
+            + timestamp_offset_ns
+        )
+
         msg = Imu()
-        msg.header.stamp.sec = timestamp.seconds
-        msg.header.stamp.nanosec = timestamp.nanos
+        msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(
+            corrected_timestamp_ns, 1_000_000_000
+        )
         msg.header.frame_id = frame_id
 
         # ImuBatch contains raw specific force and rate of turn, but no
