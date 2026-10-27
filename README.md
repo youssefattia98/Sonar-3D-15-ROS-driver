@@ -4,7 +4,8 @@
 
 This package provides a ROS 2 driver for the **Water Linked Sonar 3D-15**, a real-time multibeam imaging sonar. The sonar streams 3D range images over UDP multicast, which are decoded and published as standard ROS messages:
 
-- 3D point clouds: `sensor_msgs/PointCloud2` on `/sonar_point_cloud`, stamped with the sonar acquisition time
+- 3D point clouds: `sensor_msgs/PointCloud2` on `/sonar_point_cloud`, with
+  `x`, `y`, `z`, and `intensity` fields stamped at the sonar acquisition time
 - Raw internal IMU samples: `sensor_msgs/Imu` on `/sonr/imu/data_raw`, stamped per sample
 
 The driver listens to RIP1 multicast packets, extracts and parses `RangeImage` protobuf messages, and converts the sonar data into formats usable by standard ROS visualization and processing tools.
@@ -27,7 +28,7 @@ The driver listens to RIP1 multicast packets, extracts and parses `RangeImage` p
 
 | Topic               | Message Type              | Description                        |
 |--------------------|---------------------------|------------------------------------|
-| `/sonar_point_cloud` | `sensor_msgs/PointCloud2` | 3D point cloud in ROS frame, stamped at acquisition |
+| `/sonar_point_cloud` | `sensor_msgs/PointCloud2` | 3D point cloud in ROS frame with 8-bit logarithmic signal strength in the floating-point `intensity` field |
 | `/sonr/imu/data_raw` | `sensor_msgs/Imu` | Raw specific force and rate of turn at 100 Hz |
 
 The internal IMU is located at `(-0.022, +0.046, +0.003)` metres from the
